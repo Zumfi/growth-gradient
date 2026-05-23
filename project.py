@@ -1,19 +1,14 @@
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import accuracy_score
-
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    ExtraTreesClassifier
-)
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import DecisionTreeClassifier
+from catboost import CatBoostClassifier
 
 from sklearn.linear_model import Ridge
 
-from catboost import CatBoostClassifier
+from sklearn.metrics import accuracy_score
 
 # ==========================================================
 # 1. LOAD DATA
@@ -21,7 +16,7 @@ from catboost import CatBoostClassifier
 
 df = pd.read_csv("train_2.csv")
 
-# CLEAN COLUMNS
+# Очистка колонок
 df.columns = (
     df.columns
     .str.strip()
@@ -29,84 +24,59 @@ df.columns = (
     .str.replace(" ", "_")
 )
 
+# Переименование
 df = df.rename(columns={
     "год": "year",
     "месяц": "month",
     "рто": "target_value"
 })
 
-# SORT
+# Сортировка
 df = df.sort_values(
     ["new_id", "year", "month"]
 ).reset_index(drop=True)
 
 # ==========================================================
-# 2. TARGET ENGINEERING
+# 2. TARGET
 # ==========================================================
 
-# TARGET RATIO
-df["target_ratio"] = (
+# delta
+df["delta"] = (
     df.groupby("new_id")["target_value"]
-    .shift(-1)
-    /
-    (df["target_value"] + 1)
+    .diff()
 )
 
-# MULTICLASS TARGET
-df["target_class"] = pd.cut(
-    df["target_ratio"],
-    bins=[
-        -np.inf,
-        0.90,
-        0.98,
-        1.02,
-        1.10,
-        np.inf
-    ],
-    labels=[0,1,2,3,4]
-)
+# classification target
+df["target_class"] = (
+    df["delta"] > 0
+).astype(int)
+
+# regression target
+df["target_reg"] = df["target_value"]
 
 # ==========================================================
 # 3. FEATURE ENGINEERING
 # ==========================================================
 
 # LAGS
-for lag in [1,2,3,4,5,6,9,12]:
-
+for lag in [1,2,3,4,5,6]:
     df[f"lag_{lag}"] = (
         df.groupby("new_id")["target_value"]
         .shift(lag)
     )
 
-# ROLLING FEATURES
+# rolling
+lag_cols = [f"lag_{i}" for i in [1,2,3]]
 
-df["mean_3"] = (
-    df[[f"lag_{i}" for i in [1,2,3]]]
-    .mean(axis=1)
-)
+df["mean_3"] = df[lag_cols].mean(axis=1)
+df["std_3"] = df[lag_cols].std(axis=1)
 
-df["mean_6"] = (
-    df[[f"lag_{i}" for i in [1,2,3,4,5,6]]]
-    .mean(axis=1)
-)
-
-df["std_3"] = (
-    df[[f"lag_{i}" for i in [1,2,3]]]
-    .std(axis=1)
-)
-
-# TREND
-
-df["trend_1_3"] = (
+# trend
+df["trend"] = (
     df["lag_1"] - df["lag_3"]
 )
 
-df["trend_1_6"] = (
-    df["lag_1"] - df["lag_6"]
-)
-
-# RATIOS
-
+# ratios
 df["ratio_1_2"] = (
     df["lag_1"] / (df["lag_2"] + 1)
 )
@@ -115,28 +85,7 @@ df["ratio_1_3"] = (
     df["lag_1"] / (df["lag_3"] + 1)
 )
 
-df["ratio_1_6"] = (
-    df["lag_1"] / (df["lag_6"] + 1)
-)
-
-# MOMENTUM
-
-df["momentum"] = (
-    df["lag_1"]
-    /
-    (df["mean_3"] + 1)
-)
-
-# VOLATILITY
-
-df["volatility"] = (
-    df["std_3"]
-    /
-    (df["mean_3"] + 1)
-)
-
-# SEASONALITY
-
+# seasonality
 df["month_sin"] = np.sin(
     2 * np.pi * df["month"] / 12
 )
@@ -144,18 +93,6 @@ df["month_sin"] = np.sin(
 df["month_cos"] = np.cos(
     2 * np.pi * df["month"] / 12
 )
-
-df = df.replace([np.inf, -np.inf], np.nan)
-
-numeric_cols = df.select_dtypes(
-    include=[np.number]
-).columns
-
-for col in numeric_cols:
-
-    df[col] = df[col].fillna(
-        df[col].median()
-    )
 
 # ==========================================================
 # 4. CATEGORY ENCODING
@@ -172,34 +109,26 @@ for col in cat_cols:
 # 5. CLEAN
 # ==========================================================
 
-required_cols = [
-    "target_class",
-    "target_ratio"
-]
-
-required_cols += [
-    f"lag_{i}"
-    for i in [1,2,3,4,5,6]
-]
+required_cols = (
+    ["target_class"]
+    +
+    [f"lag_{i}" for i in [1,2,3,4,5,6]]
+)
 
 df_clean = df.dropna(
     subset=required_cols
 ).copy()
-
-df_clean["target_class"] = (
-    df_clean["target_class"]
-    .astype(int)
-)
 
 # ==========================================================
 # 6. FEATURES
 # ==========================================================
 
 drop_cols = [
-    "target_value",
-    "target_ratio",
     "target_class",
-    "new_id"
+    "target_reg",
+    "target_value",
+    "new_id",
+    "delta"
 ]
 
 features = [
@@ -208,197 +137,197 @@ features = [
 ]
 
 # ==========================================================
-# 7. VALIDATION
+# 7. VALIDATION SPLIT
 # ==========================================================
 
 val_mask = (
     (df_clean["year"] == 2025)
     &
-    (df_clean["month"] == 1)
+    (df_clean["month"] == 2)
 )
 
-train_df = df_clean.loc[
-    ~val_mask
-].copy()
-
-val_df = df_clean.loc[
-    val_mask
-].copy()
+train_df = df_clean.loc[~val_mask].copy()
+val_df = df_clean.loc[val_mask].copy()
 
 X_train = train_df[features]
-y_train = train_df["target_class"]
+y_train_class = train_df["target_class"]
+y_train_reg = train_df["target_reg"]
 
 X_val = val_df[features]
-y_val = val_df["target_class"]
+y_val_class = val_df["target_class"]
+y_val_reg = val_df["target_reg"]
 
 # ==========================================================
 # 8. BASE MODELS
 # ==========================================================
 
-print("="*60)
+print("="*50)
 print("TRAINING BASE MODELS")
-print("="*60)
+print("="*50)
 
-models = {
+# ----------------------------------------------------------
+# Logistic Regression
+# ----------------------------------------------------------
 
-    "logistic": LogisticRegression(
-        max_iter=2000,
-        random_state=42
-    ),
-
-    "rf": RandomForestClassifier(
-        n_estimators=500,
-        max_depth=12,
-        min_samples_leaf=5,
-        random_state=42,
-        n_jobs=-1
-    ),
-
-    "extra": ExtraTreesClassifier(
-        n_estimators=500,
-        max_depth=12,
-        min_samples_leaf=5,
-        random_state=42,
-        n_jobs=-1
-    ),
-
-    "tree": DecisionTreeClassifier(
-        max_depth=10,
-        min_samples_leaf=10,
-        random_state=42
-    ),
-
-    "cat": CatBoostClassifier(
-        iterations=1500,
-        learning_rate=0.02,
-        depth=6,
-        loss_function="MultiClass",
-        verbose=False,
-        random_seed=42
-    )
-}
-
-# ==========================================================
-# 9. TRAIN BASE MODELS
-# ==========================================================
-
-stack_train = pd.DataFrame()
-
-for name, model in models.items():
-
-    print(f"Training {name}")
-
-    model.fit(
-        X_train,
-        y_train
-    )
-
-    # probabilities
-    probs = model.predict_proba(X_val)
-
-    # use all classes as meta-features
-    for i in range(probs.shape[1]):
-
-        stack_train[f"{name}_class_{i}"] = probs[:, i]
-
-# ==========================================================
-# 10. META FEATURES
-# ==========================================================
-
-stack_train["mean_prob"] = (
-    stack_train.mean(axis=1)
-)
-
-stack_train["std_prob"] = (
-    stack_train.std(axis=1)
-)
-
-stack_train["max_prob"] = (
-    stack_train.max(axis=1)
-)
-
-# ==========================================================
-# 11. META MODEL
-# ==========================================================
-
-print("="*60)
-print("TRAINING META MODEL")
-print("="*60)
-
-meta_model = Ridge(
-    alpha=3.0,
+log_model = LogisticRegression(
+    max_iter=1000,
     random_state=42
 )
 
-# target = future ratio
-meta_target = (
-    val_df["target_ratio"]
-    .clip(0.5, 1.5)
+log_model.fit(
+    X_train,
+    y_train_class
 )
+
+log_val_prob = log_model.predict_proba(X_val)[:,1]
+
+# ----------------------------------------------------------
+# Decision Tree
+# ----------------------------------------------------------
+
+tree_model = DecisionTreeClassifier(
+    max_depth=8,
+    min_samples_leaf=20,
+    random_state=42
+)
+
+tree_model.fit(
+    X_train,
+    y_train_class
+)
+
+tree_val_prob = tree_model.predict_proba(X_val)[:,1]
+
+# ----------------------------------------------------------
+# Random Forest
+# ----------------------------------------------------------
+
+rf_model = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=10,
+    min_samples_leaf=10,
+    random_state=42,
+    n_jobs=-1
+)
+
+rf_model.fit(
+    X_train,
+    y_train_class
+)
+
+rf_val_prob = rf_model.predict_proba(X_val)[:,1]
+
+# ----------------------------------------------------------
+# CatBoost
+# ----------------------------------------------------------
+
+cat_model = CatBoostClassifier(
+    iterations=1000,
+    learning_rate=0.03,
+    depth=6,
+    loss_function="Logloss",
+    verbose=False,
+    random_seed=42
+)
+
+cat_model.fit(
+    X_train,
+    y_train_class,
+    verbose=False
+)
+
+cat_val_prob = cat_model.predict_proba(X_val)[:,1]
+
+# ==========================================================
+# 9. STACKING FEATURES
+# ==========================================================
+
+stack_train = pd.DataFrame({
+    "logistic": log_val_prob,
+    "tree": tree_val_prob,
+    "rf": rf_val_prob,
+    "cat": cat_val_prob
+})
+
+# ==========================================================
+# 10. META MODEL
+# ==========================================================
+
+print("="*50)
+print("TRAINING META MODEL")
+print("="*50)
+
+meta_model = Ridge(alpha=1.0)
 
 meta_model.fit(
     stack_train,
-    meta_target
+    np.log1p(y_val_reg)
 )
 
-# validation prediction
-meta_pred = meta_model.predict(
-    stack_train
-)
+meta_pred_log = meta_model.predict(stack_train)
+
+meta_pred = np.expm1(meta_pred_log)
 
 meta_pred = np.clip(
     meta_pred,
-    0.7,
-    1.3
+    0,
+    None
 )
 
-# FINAL FORECAST
-val_forecast = (
-    val_df["lag_1"].values
-    *
-    meta_pred
-)
+# ==========================================================
+# 11. VALIDATION SCORE
+# ==========================================================
 
-# DIRECTION SCORE
-direction_pred = (
-    meta_pred > 1
-).astype(int)
-
-direction_true = (
-    meta_target > 1
+val_class_pred = (
+    stack_train.mean(axis=1) > 0.5
 ).astype(int)
 
 acc = accuracy_score(
-    direction_true,
-    direction_pred
+    y_val_class,
+    val_class_pred
 )
 
-print("="*60)
-print(f"DIRECTION ACCURACY: {acc:.4f}")
-print("="*60)
+print(f"STACKING ACCURACY: {acc:.4f}")
 
 # ==========================================================
 # 12. FINAL TRAIN
 # ==========================================================
 
-print("="*60)
+print("="*50)
 print("FINAL TRAIN")
-print("="*60)
+print("="*50)
+
+# retrain all models on full data
 
 X_full = df_clean[features]
-y_full = df_clean["target_class"]
 
-for name, model in models.items():
+# logistic
+log_model.fit(
+    X_full,
+    df_clean["target_class"]
+)
 
-    print(f"Final training {name}")
+# tree
+tree_model.fit(
+    X_full,
+    df_clean["target_class"]
+)
 
-    model.fit(
-        X_full,
-        y_full
-    )
+# rf
+rf_model.fit(
+    X_full,
+    df_clean["target_class"]
+)
+
+# catboost
+cat_model.fit(
+    X_full,
+    df_clean["target_class"],
+    verbose=False
+)
 
 # ==========================================================
-# 13. TEST FORECAST
+# 13. FORECAST
 # ==========================================================
 
 latest = (
@@ -413,50 +342,45 @@ latest = (
 
 X_test = latest[features]
 
-stack_test = pd.DataFrame()
+# base predictions
 
-for name, model in models.items():
+log_test = log_model.predict_proba(X_test)[:,1]
 
-    probs = model.predict_proba(X_test)
+tree_test = tree_model.predict_proba(X_test)[:,1]
 
-    for i in range(probs.shape[1]):
+rf_test = rf_model.predict_proba(X_test)[:,1]
 
-        stack_test[f"{name}_class_{i}"] = probs[:, i]
+cat_test = cat_model.predict_proba(X_test)[:,1]
 
-# meta features
+# stacking dataframe
 
-stack_test["mean_prob"] = (
-    stack_test.mean(axis=1)
-)
+stack_test = pd.DataFrame({
+    "logistic": log_test,
+    "tree": tree_test,
+    "rf": rf_test,
+    "cat": cat_test
+})
 
-stack_test["std_prob"] = (
-    stack_test.std(axis=1)
-)
+# meta prediction
 
-stack_test["max_prob"] = (
-    stack_test.max(axis=1)
-)
+meta_test_log = meta_model.predict(stack_test)
+
+meta_test = np.expm1(meta_test_log)
 
 # ==========================================================
-# 14. META PREDICTION
+# 14. FINAL FORECAST
 # ==========================================================
 
-ratio_pred = meta_model.predict(
-    stack_test
-)
-
-ratio_pred = np.clip(
-    ratio_pred,
-    0.7,
-    1.3
-)
-
-# FINAL FORECAST
+last_rto = latest["lag_1"].values
 
 forecast = (
-    latest["lag_1"].values
+    last_rto
     *
-    ratio_pred
+    (
+        0.9
+        +
+        np.clip(meta_test, 0, 2) * 0.1
+    )
 )
 
 forecast = np.clip(
@@ -497,6 +421,6 @@ submission.to_csv(
     index=False
 )
 
-print("="*60)
-print("IMPROVED STACKING SUBMISSION SAVED")
-print("="*60)
+print("="*50)
+print("STACKING SUBMISSION SAVED")
+print("="*50)
